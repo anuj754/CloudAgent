@@ -1,6 +1,8 @@
 import logging
-import asyncio
-from typing import Any, List, Optional, Dict, Literal
+import sqlite3
+import uuid
+from typing import Any, List, Optional, Dict, Literal, TypedDict, Annotated
+from pydantic import BaseModel
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.outputs import ChatResult, ChatGeneration
 from langchain_core.messages import BaseMessage, AIMessage, ToolMessage
@@ -8,15 +10,92 @@ from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langgraph.graph import StateGraph, MessagesState, START, END
-from langgraph.prebuilt import ToolNode
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.store.sqlite import SqliteStore
+from langgraph.store.base import BaseStore
+from langgraph.prebuilt import ToolNode, InjectedStore
+from langgraph.types import interrupt
 
 from cloud_agent.config import settings
 from cloud_agent.connection import manager
 
 logger = logging.getLogger("cloud_agent.agent")
 
-# Define Tool
+# ---------------------------------------------------------------------------
+# 1. Persistence
+# ---------------------------------------------------------------------------
+
+conn = sqlite3.connect("agent_memory.db", check_same_thread=False)
+
+store = SqliteStore(conn)
+store.setup()
+
+checkpointer = SqliteSaver(conn)
+checkpointer.setup()
+
+# ---------------------------------------------------------------------------
+# 2. Long-term memory
+# ---------------------------------------------------------------------------
+
+class UserProfile(BaseModel):
+    name: Optional[str] = None
+    preferences: dict = {}
+    notes: list[str] = []
+
+def get_profile(user_id: str) -> dict:
+    existing = store.get(("profile", user_id), "data")
+    return existing.value if existing else UserProfile().model_dump()
+
+def put_profile(user_id: str, profile: dict) -> None:
+    store.put(("profile", user_id), "data", profile)
+
+@tool
+def save_memory(
+    user_id: str,
+    field: str,
+    key: Optional[str],
+    value: str,
+    *,
+    store: Annotated[BaseStore, InjectedStore()],
+) -> str:
+    """Save a fact or preference about the user for future conversations.
+    field='name' for the user's name, field='preference' with a key
+    (e.g. 'tone', 'timezone') for stated preferences, field='note' for
+    any other durable fact worth remembering."""
+    profile = get_profile(user_id)
+    if field == "name":
+        profile["name"] = value
+    elif field == "preference" and key:
+        profile["preferences"][key] = value
+    else:
+        profile["notes"].append(value)
+    put_profile(user_id, profile)
+    return f"Saved: {field} = {value}"
+
+# ---------------------------------------------------------------------------
+# 3. Control-flow tools
+# ---------------------------------------------------------------------------
+
+@tool
+def ask_user(question: str) -> str:
+    """Ask the user ONE clarifying question when information required to
+    complete their request is missing and can't be reasonably assumed.
+    Execution pauses until the user replies; the reply is returned to you."""
+    return interrupt({"question": question})
+
+@tool
+def final_answer(summary: str, result: dict) -> str:
+    """Call this exactly once, when the request is fully handled, to end
+    the turn. `summary` is a short human-readable sentence. `result` is a
+    free-form JSON object holding whatever structured data fits this
+    specific request — its shape can vary by scenario."""
+    return "finalized"
+
+# ---------------------------------------------------------------------------
+# 4. Device domain tool
+# ---------------------------------------------------------------------------
+
 @tool
 async def execute_device_command(command: str, config: Optional[dict] = None) -> str:
     """
@@ -48,7 +127,14 @@ async def execute_device_command(command: str, config: Optional[dict] = None) ->
     except Exception as e:
         return f"Error executing command: {str(e)}"
 
-# Define Mock LLM to allow complete offline execution without API keys
+DOMAIN_TOOLS = [execute_device_command]
+CONTROL_TOOLS = [save_memory, ask_user, final_answer]
+ALL_TOOLS = DOMAIN_TOOLS + CONTROL_TOOLS
+
+# ---------------------------------------------------------------------------
+# 5. Mock LLM to allow complete offline execution without API keys
+# ---------------------------------------------------------------------------
+
 class MockChatModel(BaseChatModel):
     bound_tools: List[Any] = []
 
@@ -63,62 +149,120 @@ class MockChatModel(BaseChatModel):
         tool_messages = [msg for msg in messages if isinstance(msg, ToolMessage)]
         
         if tool_messages:
-            # We just completed the tool execution. Return the final output message.
+            # We just completed the tool execution. Return a call to final_answer
             tool_output = tool_messages[-1].content
+            tool_calls = [
+                {
+                    "name": "final_answer",
+                    "args": {
+                        "summary": "Completed tool execution successfully.",
+                        "result": {"output": tool_output}
+                    },
+                    "id": f"call_mock_{uuid.uuid4().hex[:6]}",
+                    "type": "tool_call"
+                }
+            ]
             response_message = AIMessage(
-                content=f"Device execution completed successfully. Here is the output:\n\n{tool_output}"
+                content="Tool execution is complete. Finalizing response.",
+                tool_calls=tool_calls
             )
         else:
             # Inspect last human message to decide tool usage
-            last_msg = messages[-1].content.lower() if messages else ""
+            last_msg = ""
+            for msg in reversed(messages):
+                if msg.type == "human" or getattr(msg, "role", None) == "user":
+                    last_msg = msg.content.lower()
+                    break
             
-            # Rule-based routing to show tool execution
-            # Check if the user is asking to execute/run a command or check device parameters
-            device_keywords = ["run", "execute", "device", "disk", "cpu", "memory", "system", "command", "ls", "uname", "df", "free", "dir"]
-            
-            # Simple parser to extract potential shell commands
-            command_to_run = "uname -a"  # default
-            if "ls" in last_msg or "dir" in last_msg:
-                command_to_run = "dir" if "dir" in last_msg else "ls"
-            elif "disk" in last_msg or "df" in last_msg:
-                command_to_run = "df -h"
-            elif "memory" in last_msg or "free" in last_msg:
-                command_to_run = "free -m"
-            elif "cpu" in last_msg:
-                command_to_run = "lscpu"
-            elif "execute" in last_msg or "run" in last_msg:
-                # try to extract whatever command is inside quotes
-                import re
-                quotes = re.findall(r'"([^"]*)"', last_msg)
-                if quotes:
-                    command_to_run = quotes[0]
-                else:
-                    quotes_single = re.findall(r"'([^']*)'", last_msg)
-                    if quotes_single:
-                        command_to_run = quotes_single[0]
-
-            tool_calls = []
-            # If keywords match, generate tool call
-            if any(kw in last_msg for kw in device_keywords):
+            # Check for memory storage request
+            if "remember" in last_msg or "save preference" in last_msg or "my name is" in last_msg:
+                field = "name" if "name" in last_msg else "note"
+                val = last_msg.replace("remember", "").replace("my name is", "").replace("save preference", "").strip()
                 tool_calls = [
                     {
-                        "name": "execute_device_command",
-                        "args": {"command": command_to_run},
-                        "id": "call_mock_123456",
+                        "name": "save_memory",
+                        "args": {
+                            "user_id": "default_user",
+                            "field": field,
+                            "key": "pref" if "preference" in last_msg else None,
+                            "value": val
+                        },
+                        "id": f"call_mock_{uuid.uuid4().hex[:6]}",
                         "type": "tool_call"
                     }
                 ]
                 response_message = AIMessage(
-                    content="Checking target device. Executing tool command...",
+                    content="Executing save memory tool...",
                     tool_calls=tool_calls
                 )
             else:
-                response_message = AIMessage(
-                    content=f"Hello! I am the Cloud Agent. I see your request: '{messages[-1].content}'. Since no system or device commands were requested, I have responded directly without using the device tool. How else can I assist you with your device agent?"
-                )
+                # Rule-based routing to show tool execution
+                # Check if the user is asking to execute/run a command or check device parameters
+                device_keywords = ["run", "execute", "device", "disk", "cpu", "memory", "system", "command", "ls", "uname", "df", "free", "dir"]
+                
+                if any(kw in last_msg for kw in device_keywords):
+                    # Simple parser to extract potential shell commands
+                    command_to_run = "uname -a"  # default
+                    if "ls" in last_msg or "dir" in last_msg:
+                        command_to_run = "dir" if "dir" in last_msg else "ls"
+                    elif "disk" in last_msg or "df" in last_msg:
+                        command_to_run = "df -h"
+                    elif "memory" in last_msg or "free" in last_msg:
+                        command_to_run = "free -m"
+                    elif "cpu" in last_msg:
+                        command_to_run = "lscpu"
+                    elif "execute" in last_msg or "run" in last_msg:
+                        # try to extract whatever command is inside quotes
+                        import re
+                        quotes = re.findall(r'"([^"]*)"', last_msg)
+                        if quotes:
+                            command_to_run = quotes[0]
+                        else:
+                            quotes_single = re.findall(r"'([^']*)'", last_msg)
+                            if quotes_single:
+                                command_to_run = quotes_single[0]
+
+                    tool_calls = [
+                        {
+                            "name": "execute_device_command",
+                            "args": {"command": command_to_run},
+                            "id": f"call_mock_{uuid.uuid4().hex[:6]}",
+                            "type": "tool_call"
+                        }
+                    ]
+                    response_message = AIMessage(
+                        content="Checking target device. Executing tool command...",
+                        tool_calls=tool_calls
+                    )
+                else:
+                    # Greet user / answer directly using final_answer
+                    tool_calls = [
+                        {
+                            "name": "final_answer",
+                            "args": {
+                                "summary": "Direct response to query.",
+                                "result": {"message": f"Hello! I am the Cloud Agent. I see your request: '{last_msg}'. Since no system or device commands were requested, I have responded directly."}
+                            },
+                            "id": f"call_mock_{uuid.uuid4().hex[:6]}",
+                            "type": "tool_call"
+                        }
+                    ]
+                    response_message = AIMessage(
+                        content="Answering query directly...",
+                        tool_calls=tool_calls
+                    )
             
         generation = ChatGeneration(message=response_message)
         return ChatResult(generations=[generation])
+
+    async def _agenerate(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        return self._generate(messages, stop, run_manager, **kwargs)
 
     @property
     def _llm_type(self) -> str:
@@ -127,6 +271,10 @@ class MockChatModel(BaseChatModel):
     def bind_tools(self, tools: List[Any], **kwargs: Any) -> "MockChatModel":
         self.bound_tools = tools
         return self
+
+# ---------------------------------------------------------------------------
+# 6. LLM Configuration
+# ---------------------------------------------------------------------------
 
 def get_llm():
     """Initializes the LLM according to system configuration."""
@@ -145,36 +293,125 @@ def get_llm():
         logger.info("Using offline Mock Chat Model for device routing.")
         return MockChatModel()
 
-# Assemble custom LangGraph React Agent
-tools = [execute_device_command]
-tool_node = ToolNode(tools)
+def get_llm_with_tools():
+    llm = get_llm()
+    provider = settings.LLM_PROVIDER.lower()
+    if provider == "openai" and settings.OPENAI_API_KEY:
+        return llm.bind_tools(ALL_TOOLS, tool_choice="required")
+    else:
+        return llm.bind_tools(ALL_TOOLS)
 
-# Bind tools to the LLM agent
-llm = get_llm()
-llm_with_tools = llm.bind_tools(tools)
 
-# Node 1: Call LLM agent
-async def call_model(state: MessagesState):
-    messages = state['messages']
-    response = await llm_with_tools.ainvoke(messages)
+llm_with_tools = get_llm_with_tools()
+
+# ---------------------------------------------------------------------------
+# 7. Graph state + agent node
+# ---------------------------------------------------------------------------
+
+class AgentState(TypedDict):
+    messages: list
+    output: Optional[dict]
+
+SYSTEM_PROMPT = """You are a general-purpose assistant that can handle any
+kind of request (planning, answering questions, drafting things, etc).
+
+Rules:
+- Use device tools (like execute_device_command) to gather whatever real status or information the request needs.
+- If something material is missing and you can't reasonably assume it,
+  call ask_user with ONE specific question. Don't ask about things you can
+  infer or that don't materially change the outcome.
+- If the user shares a durable fact/preference/name, call save_memory.
+- When the request is fully handled, call final_answer exactly once with
+  a short summary and a result object shaped appropriately for this
+  specific request.
+
+Known user info: {profile}
+"""
+
+async def agent_node(state: AgentState, config, *, store: BaseStore):
+    user_id = config["configurable"].get("user_id", "default_user")
+    profile = get_profile(user_id)
+    system = {"role": "system", "content": SYSTEM_PROMPT.format(profile=profile)}
+    response = await llm_with_tools.ainvoke([system] + state["messages"])
     return {"messages": [response]}
 
-# Conditional routing edge
-def should_continue(state: MessagesState) -> Literal["tools", "__end__"]:
-    messages = state['messages']
-    last_message = messages[-1]
-    if last_message.tool_calls:
-        return "tools"
-    return "__end__"
+def route_after_agent(state: AgentState):
+    last = state["messages"][-1]
+    tool_calls = getattr(last, "tool_calls", None) or []
+    if any(tc["name"] == "final_answer" for tc in tool_calls):
+        return "finalize"
+    return "tools"
 
-# Build state graph
-workflow = StateGraph(MessagesState)
+def finalize(state: AgentState):
+    last = state["messages"][-1]
+    call = next(tc for tc in last.tool_calls if tc["name"] == "final_answer")
+    
+    summary = call["args"].get("summary", "Finalized.")
+    result_data = call["args"].get("result", {})
+    
+    # Format a friendly response string for client display
+    if isinstance(result_data, dict):
+        output_txt = result_data.get("output") or result_data.get("message")
+        if output_txt:
+            content = f"{summary}\n\n{output_txt}"
+        else:
+            import json
+            content = f"{summary}\n\n{json.dumps(result_data, indent=2)}"
+    else:
+        content = f"{summary}\n\n{result_data}"
 
-workflow.add_node("agent", call_model)
-workflow.add_node("tools", tool_node)
+    tool_message = ToolMessage(content=content, tool_call_id=call["id"])
+    return {"messages": [tool_message], "output": call["args"]}
 
-workflow.add_edge(START, "agent")
-workflow.add_conditional_edges("agent", should_continue)
-workflow.add_edge("tools", "agent")
+# ---------------------------------------------------------------------------
+# 8. Graph assembly
+# ---------------------------------------------------------------------------
 
-compiled_graph = workflow.compile()
+builder = StateGraph(AgentState)
+builder.add_node("agent", agent_node)
+builder.add_node("tools", ToolNode(ALL_TOOLS))
+builder.add_node("finalize", finalize)
+
+builder.add_edge(START, "agent")
+builder.add_conditional_edges(
+    "agent", route_after_agent, {"tools": "tools", "finalize": "finalize"}
+)
+builder.add_edge("tools", "agent")
+builder.add_edge("finalize", END)
+
+graph = builder.compile(checkpointer=checkpointer, store=store)
+
+# ---------------------------------------------------------------------------
+# 9. Graph wrapper for backwards capability and default session IDs
+# ---------------------------------------------------------------------------
+
+class CompiledGraphWrapper:
+    def __init__(self, inner_graph):
+        self.inner_graph = inner_graph
+
+    async def ainvoke(self, input, config=None, **kwargs):
+        if config is None:
+            config = {}
+        if "configurable" not in config:
+            config["configurable"] = {}
+        if "thread_id" not in config["configurable"]:
+            config["configurable"]["thread_id"] = "default-thread"
+        if "user_id" not in config["configurable"]:
+            config["configurable"]["user_id"] = "default_user"
+        return await self.inner_graph.ainvoke(input, config, **kwargs)
+
+    def invoke(self, input, config=None, **kwargs):
+        if config is None:
+            config = {}
+        if "configurable" not in config:
+            config["configurable"] = {}
+        if "thread_id" not in config["configurable"]:
+            config["configurable"]["thread_id"] = "default-thread"
+        if "user_id" not in config["configurable"]:
+            config["configurable"]["user_id"] = "default_user"
+        return self.inner_graph.invoke(input, config, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.inner_graph, name)
+
+compiled_graph = CompiledGraphWrapper(graph)
