@@ -1,3 +1,5 @@
+import asyncio
+import inspect
 import logging
 import sqlite3
 import uuid
@@ -21,6 +23,26 @@ from cloud_agent.config import settings
 from cloud_agent.connection import manager
 
 logger = logging.getLogger("cloud_agent.agent")
+
+scheduled_tasks: set[asyncio.Task] = set()
+
+
+async def schedule_task(callback, delay_seconds: float, *, task_name: Optional[str] = None):
+    """Run a coroutine or callable after a delay without blocking the caller."""
+    await asyncio.sleep(delay_seconds)
+
+    if inspect.iscoroutinefunction(callback):
+        await callback()
+    else:
+        result = callback()
+        if inspect.isawaitable(result):
+            await result
+
+    return {
+        "status": "completed",
+        "task_name": task_name or getattr(callback, "__name__", "scheduled_task"),
+    }
+
 
 # ---------------------------------------------------------------------------
 # 1. Persistence
@@ -127,7 +149,25 @@ async def execute_device_command(command: str, config: Optional[dict] = None) ->
     except Exception as e:
         return f"Error executing command: {str(e)}"
 
-DOMAIN_TOOLS = [execute_device_command]
+
+@tool
+async def schedule_delayed_task(task_description: str, delay_minutes: int = 30) -> str:
+    """Schedule a reminder or follow-up task to run after the requested delay in minutes."""
+    if delay_minutes < 0:
+        return "Error: delay_minutes must be zero or greater."
+
+    async def _run_task() -> None:
+        await asyncio.sleep(delay_minutes * 60)
+        logger.info("Scheduled task executed after %s minute(s): %s", delay_minutes, task_description)
+        return {"message": task_description, "delay_minutes": delay_minutes}
+
+    task = asyncio.create_task(_run_task())
+    scheduled_tasks.add(task)
+    task.add_done_callback(scheduled_tasks.discard)
+    return f"Scheduled task: {task_description} in {delay_minutes} minute(s)."
+
+
+DOMAIN_TOOLS = [execute_device_command, schedule_delayed_task]
 CONTROL_TOOLS = [save_memory, ask_user, final_answer]
 ALL_TOOLS = DOMAIN_TOOLS + CONTROL_TOOLS
 
@@ -193,6 +233,31 @@ class MockChatModel(BaseChatModel):
                 ]
                 response_message = AIMessage(
                     content="Executing save memory tool...",
+                    tool_calls=tool_calls
+                )
+            elif "schedule" in last_msg or "remind" in last_msg or "task" in last_msg:
+                import re
+
+                delay_minutes = 30
+                match = re.search(r"(\d+)\s*(minute|minutes|min|mins|hour|hours|hr|hrs)", last_msg)
+                if match:
+                    value = int(match.group(1))
+                    unit = match.group(2).lower()
+                    delay_minutes = value * 60 if unit.startswith("hour") else value
+
+                tool_calls = [
+                    {
+                        "name": "schedule_delayed_task",
+                        "args": {
+                            "task_description": last_msg,
+                            "delay_minutes": delay_minutes,
+                        },
+                        "id": f"call_mock_{uuid.uuid4().hex[:6]}",
+                        "type": "tool_call"
+                    }
+                ]
+                response_message = AIMessage(
+                    content="Scheduling a delayed task...",
                     tool_calls=tool_calls
                 )
             else:
@@ -321,6 +386,7 @@ Rules:
   call ask_user with ONE specific question. Don't ask about things you can
   infer or that don't materially change the outcome.
 - If the user shares a durable fact/preference/name, call save_memory.
+- If the user wants a reminder or delayed follow-up task, call schedule_delayed_task with a clear task description and delay in minutes.
 - When the request is fully handled, call final_answer exactly once with
   a short summary and a result object shaped appropriately for this
   specific request.
